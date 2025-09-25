@@ -1,0 +1,215 @@
+// server.js
+const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+app.use(express.static("public")); // serve client files from /public
+
+io.on("connection", (socket) => {
+  console.log("New user:", socket.id);
+
+  socket.on("join-room", (roomId) => {
+    socket.join(roomId);
+    socket.to(roomId).emit("user-joined", socket.id);
+  });
+
+  socket.on("offer", ({ offer, to }) => {
+    io.to(to).emit("offer", { offer, from: socket.id });
+  });
+
+  socket.on("answer", ({ answer, to }) => {
+    io.to(to).emit("answer", { answer, from: socket.id });
+  });
+
+  socket.on("ice-candidate", ({ candidate, to }) => {
+    io.to(to).emit("ice-candidate", { candidate, from: socket.id });
+  });
+
+  socket.on("file-share", ({ fileName, fileData, roomId }) => {
+    socket.to(roomId).emit("file-share", { fileName, fileData });
+  });
+
+  socket.on("draw", ({ roomId, x, y }) => {
+    socket.to(roomId).emit("draw", { x, y });
+  });
+
+  socket.on("disconnect", () => {
+    console.log("Disconnected:", socket.id);
+    io.emit("user-left", socket.id);
+  });
+});
+
+const PORT = 4000;
+server.listen(PORT, () => console.log(Server running on http://localhost:${PORT}));
+2) Client (/public/index.html)
+html
+Copy code
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>RTC App</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    video { width: 240px; height: 180px; background: #000; margin: 5px; }
+    #videos { display: flex; flex-wrap: wrap; }
+    #whiteboard { border: 1px solid #000; cursor: crosshair; }
+  </style>
+</head>
+<body>
+  <h2>Real-Time Communication App</h2>
+  
+  <div>
+    Room ID: <input id="roomId" value="demo123">
+    <button onclick="joinRoom()">Join</button>
+    <button onclick="shareScreen()">Share Screen</button>
+    <button onclick="toggleVideo()">Toggle Camera</button>
+  </div>
+  
+  <h3>Videos</h3>
+  <div id="videos">
+    <video id="localVideo" autoplay muted></video>
+  </div>
+
+  <h3>File Sharing</h3>
+  <input type="file" id="fileInput">
+  <button onclick="sendFile()">Send File</button>
+  <div id="files"></div>
+
+  <h3>Whiteboard</h3>
+  <canvas id="whiteboard" width="400" height="300"></canvas>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+    const peers = {};
+    const config = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+    const localVideo = document.getElementById("localVideo");
+    const videos = document.getElementById("videos");
+    const fileInput = document.getElementById("fileInput");
+    const filesDiv = document.getElementById("files");
+    const whiteboard = document.getElementById("whiteboard");
+    const ctx = whiteboard.getContext("2d");
+    let localStream, roomId;
+
+    async function joinRoom() {
+      roomId = document.getElementById("roomId").value;
+      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localVideo.srcObject = localStream;
+      socket.emit("join-room", roomId);
+    }
+
+    socket.on("user-joined", async (id) => {
+      const pc = createPeerConnection(id);
+      peers[id] = pc;
+
+      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socket.emit("offer", { offer, to: id });
+    });
+
+    socket.on("offer", async ({ offer, from }) => {
+      const pc = createPeerConnection(from);
+      peers[from] = pc;
+
+      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+      await pc.setRemoteDescription(offer);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socket.emit("answer", { answer, to: from });
+    });
+
+    socket.on("answer", async ({ answer, from }) => {
+      await peers[from].setRemoteDescription(answer);
+    });
+
+    socket.on("ice-candidate", ({ candidate, from }) => {
+      peers[from].addIceCandidate(new RTCIceCandidate(candidate));
+    });
+
+    socket.on("user-left", (id) => {
+      if (peers[id]) {
+        peers[id].close();
+        delete peers[id];
+        document.getElementById(id)?.remove();
+      }
+    });
+
+    function createPeerConnection(id) {
+      const pc = new RTCPeerConnection(config);
+      pc.onicecandidate = (e) => {
+        if (e.candidate) socket.emit("ice-candidate", { candidate: e.candidate, to: id });
+      };
+      pc.ontrack = (e) => {
+        if (!document.getElementById(id)) {
+          const vid = document.createElement("video");
+          vid.id = id;
+          vid.autoplay = true;
+          vid.srcObject = e.streams[0];
+          videos.appendChild(vid);
+        }
+      };
+      return pc;
+    }
+
+    // --- File Sharing ---
+    function sendFile() {
+      const file = fileInput.files[0];
+      const reader = new FileReader();
+      reader.onload = () => {
+        socket.emit("file-share", { fileName: file.name, fileData: reader.result, roomId });
+      };
+      reader.readAsDataURL(file);
+    }
+    socket.on("file-share", ({ fileName, fileData }) => {
+      const a = document.createElement("a");
+      a.href = fileData;
+      a.download = fileName;
+      a.textContent = "Download " + fileName;
+      filesDiv.appendChild(a);
+      filesDiv.appendChild(document.createElement("br"));
+    });
+
+    // --- Screen Sharing ---
+    async function shareScreen() {
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      const screenTrack = screenStream.getVideoTracks()[0];
+      Object.values(peers).forEach(pc => {
+        const sender = pc.getSenders().find(s => s.track.kind === "video");
+        sender.replaceTrack(screenTrack);
+      });
+      localVideo.srcObject = screenStream;
+      screenTrack.onended = () => {
+        localStream.getVideoTracks()[0].enabled = true;
+        localVideo.srcObject = localStream;
+      };
+    }
+
+    // --- Toggle Camera ---
+    function toggleVideo() {
+      localStream.getVideoTracks()[0].enabled = !localStream.getVideoTracks()[0].enabled;
+    }
+
+    // --- Whiteboard ---
+    let drawing = false;
+    whiteboard.addEventListener("mousedown", () => drawing = true);
+    whiteboard.addEventListener("mouseup", () => drawing = false);
+    whiteboard.addEventListener("mousemove", (e) => {
+      if (!drawing) return;
+      const x = e.offsetX, y = e.offsetY;
+      ctx.fillRect(x, y, 2, 2);
+      socket.emit("draw", { roomId, x, y });
+    });
+
+    socket.on("draw", ({ x, y }) => {
+      ctx.fillRect(x, y, 2, 2);
+    });
+  </script>
+</body>
+</html>
